@@ -129,6 +129,7 @@ const TRAP_ACTIVITIES = [
   "Give a closure check and one lesson learned item.",
 ];
 const ANSWER_REVEAL_MS = 3000;
+const QUESTION_TIMEOUT_MS = 45000;
 const legacyDemoTeamNames = new Set([
   "team alpha",
   "team bravo",
@@ -276,6 +277,7 @@ function buildInitialGameState(session) {
     turnMessage:
       "Roll d6 and move clockwise. Red/Blue/Green: answer QCM. Neutral: roll again or move +1.",
     pendingQuestion: null,
+    pendingQuestionOpenedAt: null,
     answerReveal: null,
     pendingNeutral: false,
     pendingTrap: null,
@@ -321,6 +323,7 @@ function advanceGameTurn(session) {
   session.gameState.currentTeamIndex =
     (session.gameState.currentTeamIndex + 1) % session.gameState.teams.length;
   session.gameState.pendingQuestion = null;
+  session.gameState.pendingQuestionOpenedAt = null;
   session.gameState.answerReveal = null;
   session.gameState.pendingNeutral = false;
   session.gameState.pendingTrap = null;
@@ -345,6 +348,7 @@ function resolveMove(session, steps) {
   if (landed === "neutral") {
     gameState.pendingNeutral = true;
     gameState.pendingQuestion = null;
+    gameState.pendingQuestionOpenedAt = null;
     gameState.turnMessage = `${team.name} landed on Neutral. Choose roll again or move +1.`;
     gameState.updatedAt = new Date().toISOString();
     return;
@@ -352,6 +356,7 @@ function resolveMove(session, steps) {
 
   const deck = QUESTION_DECK.filter((question) => question.category === landed);
   gameState.pendingQuestion = randomFrom(deck);
+  gameState.pendingQuestionOpenedAt = Date.now();
   gameState.pendingNeutral = false;
   gameState.turnMessage = `${team.name} landed on ${CATEGORY_LABEL[landed]}. Answer to earn a wedge.`;
   gameState.updatedAt = new Date().toISOString();
@@ -366,6 +371,37 @@ function ensureGameState(session) {
     const hideAt = Number(session.gameState.answerReveal.hideAt || 0);
     if (hideAt > 0 && Date.now() >= hideAt) {
       advanceGameTurn(session);
+      return;
+    }
+  }
+
+  if (session.gameState.pendingQuestion) {
+    if (!session.gameState.pendingQuestionOpenedAt) {
+      session.gameState.pendingQuestionOpenedAt = Date.now();
+      session.gameState.updatedAt = new Date().toISOString();
+    }
+
+    const openedAt = Number(session.gameState.pendingQuestionOpenedAt || 0);
+    if (Date.now() - openedAt >= QUESTION_TIMEOUT_MS) {
+      const activeTeam = getActiveGameTeam(session);
+      if (!activeTeam) {
+        return;
+      }
+
+      const timedOutQuestion = session.gameState.pendingQuestion;
+      session.gameState.pendingQuestion = null;
+      session.gameState.pendingQuestionOpenedAt = null;
+      session.gameState.answerReveal = {
+        question: timedOutQuestion,
+        selectedOptionIndex: -1,
+        correct: false,
+        correctOptionIndex: timedOutQuestion.correctOptionIndex,
+        teamId: activeTeam.id,
+        teamName: activeTeam.name,
+        hideAt: Date.now() + ANSWER_REVEAL_MS,
+      };
+      session.gameState.turnMessage = `${activeTeam.name} timed out. Showing the correct answer.`;
+      session.gameState.updatedAt = new Date().toISOString();
     }
   }
 }
@@ -814,6 +850,7 @@ app.post("/api/sessions/:code/game/answer", (req, res) => {
     : `${activeTeam.name} answered wrong. Turn ends.`;
 
   gameState.pendingQuestion = null;
+  gameState.pendingQuestionOpenedAt = null;
   gameState.answerReveal = {
     question: pendingQuestion,
     selectedOptionIndex,
