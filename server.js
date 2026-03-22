@@ -603,8 +603,61 @@ function sanitizeSession(session) {
     players: session.players,
     teams: session.teams,
     scoreEvents: session.scoreEvents,
+    activityEvents: Array.isArray(session.activityEvents) ? session.activityEvents : [],
     leaderboard,
   };
+}
+
+function pushActivityEvent(session, type, message, meta = {}) {
+  if (!Array.isArray(session.activityEvents)) {
+    session.activityEvents = [];
+  }
+
+  session.activityEvents.push({
+    id: randomUUID(),
+    at: new Date().toISOString(),
+    type,
+    message,
+    ...meta,
+  });
+
+  if (session.activityEvents.length > 80) {
+    session.activityEvents = session.activityEvents.slice(-80);
+  }
+}
+
+function removePlayerFromTeams(session, playerId) {
+  for (const team of session.teams) {
+    if (team.playerIds.includes(playerId)) {
+      team.playerIds = team.playerIds.filter((id) => id !== playerId);
+    }
+  }
+}
+
+function rememberRecentlyLeft(session, player) {
+  if (!Array.isArray(session.recentlyLeft)) {
+    session.recentlyLeft = [];
+  }
+
+  const existingIndex = session.recentlyLeft.findIndex(
+    (entry) => entry.username.toLowerCase() === player.username.toLowerCase(),
+  );
+
+  const entry = {
+    username: player.username,
+    teamId: player.teamId || null,
+    leftAt: new Date().toISOString(),
+  };
+
+  if (existingIndex >= 0) {
+    session.recentlyLeft[existingIndex] = entry;
+  } else {
+    session.recentlyLeft.push(entry);
+  }
+
+  if (session.recentlyLeft.length > 100) {
+    session.recentlyLeft = session.recentlyLeft.slice(-100);
+  }
 }
 
 async function getSessionOr404(req, res) {
@@ -887,6 +940,8 @@ app.get("/", (req, res) => {
       "GET /api/sessions/:code",
       "GET /api/sessions/:code/players",
       "POST /api/sessions/:code/players/:playerId/team",
+      "POST /api/sessions/:code/players/:playerId/kick",
+      "POST /api/sessions/:code/leave",
       "POST /api/sessions/:code/teams",
       "POST /api/sessions/:code/start",
       "GET /api/sessions/:code/game-state",
@@ -930,8 +985,15 @@ app.post("/api/sessions", async (req, res) => {
     players: [hostPlayer],
     teams: [],
     scoreEvents: [],
+    activityEvents: [],
+    recentlyLeft: [],
     gameState: null,
   };
+
+  pushActivityEvent(session, "host-created", `${username} created the session.`, {
+    playerId: hostPlayerId,
+    username,
+  });
 
   await saveSession(session);
   logInfo("session.created", {
@@ -961,22 +1023,7 @@ app.post("/api/sessions/:code/join", async (req, res) => {
   );
 
   if (duplicatePlayer) {
-    await touchPlayerLastSeen(session.code, duplicatePlayer.id);
-    logInfo("session.player.reconnected", {
-      code: session.code,
-      playerId: duplicatePlayer.id,
-      username: duplicatePlayer.username,
-    });
-    res.status(200).json({
-      session: sanitizeSession(session),
-      player: duplicatePlayer,
-      reconnected: true,
-    });
-    return;
-  }
-
-  if (session.status !== "lobby") {
-    res.status(409).json({ error: "Session has already started. Use the same username to reconnect." });
+    res.status(409).json({ error: "This username is already in the session." });
     return;
   }
 
@@ -988,8 +1035,47 @@ app.post("/api/sessions/:code/join", async (req, res) => {
     joinedAt: new Date().toISOString(),
   };
 
+  const recentlyLeft = Array.isArray(session.recentlyLeft)
+    ? session.recentlyLeft.find((entry) => entry.username.toLowerCase() === username.toLowerCase())
+    : null;
+
+  if (session.status !== "lobby" && !recentlyLeft) {
+    res.status(409).json({ error: "Session has already started." });
+    return;
+  }
+
+  if (recentlyLeft?.teamId) {
+    const previousTeam = findTeam(session, recentlyLeft.teamId);
+    if (previousTeam) {
+      player.teamId = previousTeam.id;
+      if (!previousTeam.playerIds.includes(player.id)) {
+        previousTeam.playerIds.push(player.id);
+      }
+    }
+  }
+
   session.players.push(player);
+  if (Array.isArray(session.recentlyLeft)) {
+    session.recentlyLeft = session.recentlyLeft.filter(
+      (entry) => entry.username.toLowerCase() !== username.toLowerCase(),
+    );
+  }
+
+  pushActivityEvent(
+    session,
+    recentlyLeft ? "player-rejoined" : "player-joined",
+    recentlyLeft
+      ? `${player.username} has rejoined the game.`
+      : `${player.username} has joined the game.`,
+    {
+      playerId: player.id,
+      username: player.username,
+      teamId: player.teamId,
+    },
+  );
+
   await saveSession(session);
+  await touchPlayerLastSeen(session.code, player.id);
   logInfo("session.player.joined", {
     code: session.code,
     playerId: player.id,
@@ -999,6 +1085,108 @@ app.post("/api/sessions/:code/join", async (req, res) => {
   res.status(201).json({
     session: sanitizeSession(session),
     player,
+    reconnected: Boolean(recentlyLeft),
+  });
+});
+
+app.post("/api/sessions/:code/leave", async (req, res) => {
+  const session = await getSessionOr404(req, res);
+  if (!session) return;
+
+  const playerId = normalizeName(req.body?.playerId);
+  if (!playerId) {
+    res.status(400).json({ error: "playerId is required." });
+    return;
+  }
+
+  const player = findPlayer(session, playerId);
+  if (!player) {
+    res.status(200).json({ message: "Player already left the session." });
+    return;
+  }
+
+  if (player.isHost || player.id === session.hostPlayerId) {
+    await deleteSessionByCode(session.code);
+    logInfo("session.closed_by_host", {
+      code: session.code,
+      hostPlayerId: player.id,
+      hostUsername: player.username,
+    });
+    res.json({
+      message: "Host left. Session closed.",
+      sessionClosed: true,
+      closedByHost: player.username,
+    });
+    return;
+  }
+
+  removePlayerFromTeams(session, player.id);
+  rememberRecentlyLeft(session, player);
+  session.players = session.players.filter((existing) => existing.id !== player.id);
+
+  pushActivityEvent(session, "player-left", `${player.username} has quit the game.`, {
+    playerId: player.id,
+    username: player.username,
+    teamId: player.teamId,
+  });
+
+  await saveSession(session);
+  logInfo("session.player.left", {
+    code: session.code,
+    playerId: player.id,
+    username: player.username,
+    remainingPlayers: session.players.length,
+  });
+
+  res.json({
+    message: "Player left the session.",
+    sessionClosed: false,
+    session: sanitizeSession(session),
+  });
+});
+
+app.post("/api/sessions/:code/players/:playerId/kick", async (req, res) => {
+  const session = await getSessionOr404(req, res);
+  if (!session) return;
+
+  const hostPlayerId = normalizeName(req.body?.hostPlayerId);
+  if (!hostPlayerId || !assertHost(session, hostPlayerId, res)) {
+    return;
+  }
+
+  const targetPlayerId = normalizeName(req.params.playerId);
+  const targetPlayer = findPlayer(session, targetPlayerId);
+  if (!targetPlayer) {
+    res.status(404).json({ error: "Player not found." });
+    return;
+  }
+
+  if (targetPlayer.id === session.hostPlayerId || targetPlayer.isHost) {
+    res.status(409).json({ error: "Host cannot be kicked." });
+    return;
+  }
+
+  removePlayerFromTeams(session, targetPlayer.id);
+  rememberRecentlyLeft(session, targetPlayer);
+  session.players = session.players.filter((player) => player.id !== targetPlayer.id);
+
+  pushActivityEvent(session, "player-kicked", `${targetPlayer.username} was removed by host.`, {
+    playerId: targetPlayer.id,
+    username: targetPlayer.username,
+    teamId: targetPlayer.teamId,
+  });
+
+  await saveSession(session);
+  logInfo("session.player.kicked", {
+    code: session.code,
+    hostPlayerId,
+    kickedPlayerId: targetPlayer.id,
+    kickedUsername: targetPlayer.username,
+  });
+
+  res.json({
+    message: "Player removed from session.",
+    session: sanitizeSession(session),
   });
 });
 
