@@ -1,11 +1,23 @@
+require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const { randomUUID } = require("crypto");
+const { Pool } = require("pg");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
+const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
+const USE_POSTGRES = DATABASE_URL.length > 0;
+const REQUEST_LOG_BODY_LIMIT = 200;
 
 const sessions = new Map();
+const dbPool = USE_POSTGRES
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: process.env.PGSSL === "false" ? false : { rejectUnauthorized: false },
+    })
+  : null;
 const categories = ["red", "blue", "green"];
 const CATEGORY_LABEL = {
   red: "Detection & Logging",
@@ -19,7 +31,7 @@ const SPACES = Array.from({ length: 24 }, (_, index) => {
   if (cycle === 2) return "green";
   return "neutral";
 });
-const QUESTION_DECK = [
+const DEFAULT_QUESTION_DECK = [
   {
     category: "red",
     prompt: "What should happen first when an alert triggers?",
@@ -120,6 +132,7 @@ const QUESTION_DECK = [
     correctOptionIndex: 0,
   },
 ];
+let questionDeck = [...DEFAULT_QUESTION_DECK];
 const TRAP_ACTIVITIES = [
   "Name 3 actions to stabilize an incident in 20 seconds.",
   "Give one escalation reason and one communication channel.",
@@ -151,8 +164,393 @@ const legacyDemoPlayerNames = new Set([
   "mina",
 ]);
 
+function truncateForLog(value, maxLength = REQUEST_LOG_BODY_LIMIT) {
+  const normalized = String(value ?? "");
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength)}...`;
+}
+
+function logInfo(event, details = {}) {
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      level: "info",
+      event,
+      ...details,
+    }),
+  );
+}
+
+function logError(event, error, details = {}) {
+  console.error(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      level: "error",
+      event,
+      ...details,
+      errorMessage: error?.message || "Unknown error",
+      errorCode: error?.code || null,
+    }),
+  );
+}
+
 app.use(cors());
 app.use(express.json());
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  const requestId = randomUUID().slice(0, 8);
+  req.requestId = requestId;
+
+  logInfo("request.start", {
+    requestId,
+    method: req.method,
+    path: req.path,
+    query: req.query,
+    body: truncateForLog(JSON.stringify(req.body || {})),
+  });
+
+  res.on("finish", () => {
+    logInfo("request.end", {
+      requestId,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      durationMs: Date.now() - startedAt,
+    });
+  });
+
+  next();
+});
+
+async function initializeStorage() {
+  if (!USE_POSTGRES || !dbPool) {
+    questionDeck = [...DEFAULT_QUESTION_DECK];
+    logInfo("storage.initialized", { mode: "memory", questionCount: questionDeck.length });
+    return;
+  }
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      code TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      host_player_id UUID NOT NULL,
+      payload JSONB NOT NULL,
+      version INTEGER NOT NULL DEFAULT 1,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      started_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS session_players (
+      id UUID PRIMARY KEY,
+      session_code TEXT NOT NULL REFERENCES sessions(code) ON DELETE CASCADE,
+      username TEXT NOT NULL,
+      is_host BOOLEAN NOT NULL DEFAULT FALSE,
+      team_id UUID,
+      joined_at TIMESTAMPTZ NOT NULL,
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      is_connected BOOLEAN NOT NULL DEFAULT TRUE
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_session_players_name
+      ON session_players (session_code, lower(username));
+
+    CREATE INDEX IF NOT EXISTS idx_session_players_session_code
+      ON session_players (session_code);
+
+    CREATE TABLE IF NOT EXISTS questions (
+      id BIGSERIAL PRIMARY KEY,
+      category TEXT NOT NULL CHECK (category IN ('red', 'blue', 'green')),
+      prompt TEXT NOT NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS question_options (
+      id BIGSERIAL PRIMARY KEY,
+      question_id BIGINT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+      option_index INTEGER NOT NULL CHECK (option_index >= 0),
+      option_text TEXT NOT NULL,
+      is_correct BOOLEAN NOT NULL DEFAULT FALSE,
+      UNIQUE (question_id, option_index)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_question_single_correct
+      ON question_options (question_id)
+      WHERE is_correct = TRUE
+  `);
+
+  await refreshQuestionDeck();
+  logInfo("storage.initialized", { mode: "postgres", questionCount: questionDeck.length });
+}
+
+function mapQuestionRowsToDeck(rows) {
+  const byId = new Map();
+
+  for (const row of rows) {
+    let entry = byId.get(row.id);
+    if (!entry) {
+      entry = {
+        category: row.category,
+        prompt: row.prompt,
+        options: [],
+        correctOptionIndex: null,
+      };
+      byId.set(row.id, entry);
+    }
+
+    entry.options[row.option_index] = row.option_text;
+    if (row.is_correct) {
+      entry.correctOptionIndex = row.option_index;
+    }
+  }
+
+  return [...byId.values()].filter(
+    (question) =>
+      categories.includes(question.category) &&
+      question.options.length > 1 &&
+      Number.isInteger(question.correctOptionIndex),
+  );
+}
+
+async function refreshQuestionDeck() {
+  if (!USE_POSTGRES || !dbPool) {
+    questionDeck = [...DEFAULT_QUESTION_DECK];
+    logInfo("questions.deck.loaded", { source: "memory-default", questionCount: questionDeck.length });
+    return;
+  }
+
+  const result = await dbPool.query(
+    `
+      SELECT
+        q.id,
+        q.category,
+        q.prompt,
+        o.option_index,
+        o.option_text,
+        o.is_correct
+      FROM questions q
+      JOIN question_options o ON o.question_id = q.id
+      WHERE q.is_active = TRUE
+      ORDER BY q.id, o.option_index
+    `,
+  );
+
+  const mapped = mapQuestionRowsToDeck(result.rows);
+  questionDeck = mapped.length > 0 ? mapped : [...DEFAULT_QUESTION_DECK];
+  logInfo("questions.deck.loaded", {
+    source: mapped.length > 0 ? "database" : "memory-default",
+    questionCount: questionDeck.length,
+  });
+}
+
+async function loadPlayersForSession(code) {
+  if (!USE_POSTGRES || !dbPool) {
+    return null;
+  }
+
+  const result = await dbPool.query(
+    `
+      SELECT id, username, is_host, team_id, joined_at
+      FROM session_players
+      WHERE session_code = $1
+      ORDER BY joined_at ASC
+    `,
+    [code],
+  );
+
+  return result.rows.map((row) => ({
+    id: row.id,
+    username: row.username,
+    isHost: Boolean(row.is_host),
+    teamId: row.team_id || null,
+    joinedAt: new Date(row.joined_at).toISOString(),
+  }));
+}
+
+async function savePlayersForSession(client, code, players) {
+  await client.query("DELETE FROM session_players WHERE session_code = $1", [code]);
+
+  for (const player of players) {
+    await client.query(
+      `
+        INSERT INTO session_players (
+          id,
+          session_code,
+          username,
+          is_host,
+          team_id,
+          joined_at,
+          last_seen_at,
+          is_connected
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, NOW(), TRUE)
+      `,
+      [
+        player.id,
+        code,
+        player.username,
+        Boolean(player.isHost),
+        player.teamId || null,
+        player.joinedAt || new Date().toISOString(),
+      ],
+    );
+  }
+}
+
+async function touchPlayerLastSeen(code, playerId) {
+  if (!USE_POSTGRES || !dbPool) {
+    return;
+  }
+
+  await dbPool.query(
+    `
+      UPDATE session_players
+      SET last_seen_at = NOW(), is_connected = TRUE
+      WHERE session_code = $1 AND id = $2
+    `,
+    [code, playerId],
+  );
+}
+
+async function sessionCodeExists(code) {
+  if (sessions.has(code)) {
+    return true;
+  }
+
+  if (!USE_POSTGRES || !dbPool) {
+    return false;
+  }
+
+  const result = await dbPool.query("SELECT 1 FROM sessions WHERE code = $1 LIMIT 1", [code]);
+  return result.rowCount > 0;
+}
+
+async function loadSession(code) {
+  const normalizedCode = String(code || "").toUpperCase();
+  if (!normalizedCode) {
+    return null;
+  }
+
+  if (!USE_POSTGRES || !dbPool) {
+    const session = sessions.get(normalizedCode) || null;
+    logInfo("session.load", {
+      code: normalizedCode,
+      source: "memory",
+      found: Boolean(session),
+    });
+    return session;
+  }
+
+  const result = await dbPool.query("SELECT payload FROM sessions WHERE code = $1", [normalizedCode]);
+  if (result.rowCount === 0) {
+    sessions.delete(normalizedCode);
+    logInfo("session.load", {
+      code: normalizedCode,
+      source: "postgres",
+      found: false,
+    });
+    return null;
+  }
+
+  const session = result.rows[0].payload;
+  const loadedPlayers = await loadPlayersForSession(normalizedCode);
+  if (loadedPlayers && loadedPlayers.length > 0) {
+    session.players = loadedPlayers;
+  }
+  sessions.set(normalizedCode, session);
+  logInfo("session.load", {
+    code: normalizedCode,
+    source: "postgres",
+    found: true,
+    players: Array.isArray(session.players) ? session.players.length : 0,
+    status: session.status,
+  });
+  return session;
+}
+
+async function saveSession(session) {
+  sessions.set(session.code, session);
+
+  if (!USE_POSTGRES || !dbPool) {
+    logInfo("session.save", {
+      code: session.code,
+      source: "memory",
+      status: session.status,
+      players: Array.isArray(session.players) ? session.players.length : 0,
+    });
+    return;
+  }
+
+  const client = await dbPool.connect();
+  try {
+    await client.query("BEGIN");
+
+    await client.query(
+      `
+        INSERT INTO sessions (
+          code,
+          status,
+          host_player_id,
+          payload,
+          version,
+          created_at,
+          started_at,
+          updated_at
+        )
+        VALUES ($1, $2, $3, $4::jsonb, 1, $5, $6, NOW())
+        ON CONFLICT (code)
+        DO UPDATE SET
+          status = EXCLUDED.status,
+          host_player_id = EXCLUDED.host_player_id,
+          payload = EXCLUDED.payload,
+          started_at = EXCLUDED.started_at,
+          version = sessions.version + 1,
+          updated_at = NOW()
+      `,
+      [
+        session.code,
+        session.status,
+        session.hostPlayerId,
+        JSON.stringify(session),
+        session.createdAt || new Date().toISOString(),
+        session.startedAt || null,
+      ],
+    );
+
+    await savePlayersForSession(client, session.code, session.players || []);
+    await client.query("COMMIT");
+    logInfo("session.save", {
+      code: session.code,
+      source: "postgres",
+      status: session.status,
+      players: Array.isArray(session.players) ? session.players.length : 0,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    logError("session.save.failed", error, {
+      code: session.code,
+      source: USE_POSTGRES ? "postgres" : "memory",
+      status: session.status,
+    });
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function deleteSessionByCode(code) {
+  const normalizedCode = String(code || "").toUpperCase();
+  sessions.delete(normalizedCode);
+
+  if (!USE_POSTGRES || !dbPool) {
+    return;
+  }
+
+  await dbPool.query("DELETE FROM sessions WHERE code = $1", [normalizedCode]);
+}
 
 function generateSessionCode() {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -163,9 +561,9 @@ function generateSessionCode() {
   return code;
 }
 
-function createUniqueSessionCode() {
+async function createUniqueSessionCode() {
   let code = generateSessionCode();
-  while (sessions.has(code)) {
+  while (await sessionCodeExists(code)) {
     code = generateSessionCode();
   }
   return code;
@@ -209,9 +607,9 @@ function sanitizeSession(session) {
   };
 }
 
-function getSessionOr404(req, res) {
+async function getSessionOr404(req, res) {
   const code = String(req.params.code || "").toUpperCase();
-  const session = sessions.get(code);
+  const session = await loadSession(code);
   if (!session) {
     res.status(404).json({ error: "Session not found." });
     return null;
@@ -354,7 +752,15 @@ function resolveMove(session, steps) {
     return;
   }
 
-  const deck = QUESTION_DECK.filter((question) => question.category === landed);
+  const deck = questionDeck.filter((question) => question.category === landed);
+  if (deck.length === 0) {
+    gameState.pendingQuestion = null;
+    gameState.pendingQuestionOpenedAt = null;
+    gameState.pendingNeutral = false;
+    gameState.turnMessage = `${team.name} landed on ${CATEGORY_LABEL[landed]}, but no active question exists for this category.`;
+    gameState.updatedAt = new Date().toISOString();
+    return;
+  }
   gameState.pendingQuestion = randomFrom(deck);
   gameState.pendingQuestionOpenedAt = Date.now();
   gameState.pendingNeutral = false;
@@ -362,15 +768,20 @@ function resolveMove(session, steps) {
   gameState.updatedAt = new Date().toISOString();
 }
 
-function ensureGameState(session) {
+async function ensureGameState(session) {
+  let changed = false;
+
   if (!session.gameState) {
     session.gameState = buildInitialGameState(session);
+    changed = true;
   }
 
   if (session.gameState.answerReveal) {
     const hideAt = Number(session.gameState.answerReveal.hideAt || 0);
     if (hideAt > 0 && Date.now() >= hideAt) {
       advanceGameTurn(session);
+      changed = true;
+      await saveSession(session);
       return;
     }
   }
@@ -379,6 +790,7 @@ function ensureGameState(session) {
     if (!session.gameState.pendingQuestionOpenedAt) {
       session.gameState.pendingQuestionOpenedAt = Date.now();
       session.gameState.updatedAt = new Date().toISOString();
+      changed = true;
     }
 
     const openedAt = Number(session.gameState.pendingQuestionOpenedAt || 0);
@@ -402,7 +814,12 @@ function ensureGameState(session) {
       };
       session.gameState.turnMessage = `${activeTeam.name} timed out. Showing the correct answer.`;
       session.gameState.updatedAt = new Date().toISOString();
+      changed = true;
     }
+  }
+
+  if (changed) {
+    await saveSession(session);
   }
 }
 
@@ -439,7 +856,7 @@ function cleanupLegacySessionData(session) {
     session.teams.every((team) => legacyDemoTeamNames.has(normalizeName(team.name).toLowerCase()));
 
   if (!hasLegacyTeams) {
-    return;
+    return false;
   }
 
   session.teams = [];
@@ -455,12 +872,15 @@ function cleanupLegacySessionData(session) {
   for (const player of session.players) {
     player.teamId = null;
   }
+
+  return true;
 }
 
 app.get("/", (req, res) => {
   res.json({
     message: "Incident Game API running",
     version: "1.0.0",
+    storageMode: USE_POSTGRES ? "postgres" : "memory",
     endpoints: [
       "POST /api/sessions",
       "POST /api/sessions/:code/join",
@@ -483,7 +903,7 @@ app.get("/", (req, res) => {
   });
 });
 
-app.post("/api/sessions", (req, res) => {
+app.post("/api/sessions", async (req, res) => {
   const username = normalizeName(req.body?.username);
   if (!username) {
     res.status(400).json({ error: "username is required." });
@@ -491,7 +911,7 @@ app.post("/api/sessions", (req, res) => {
   }
 
   const hostPlayerId = randomUUID();
-  const sessionCode = createUniqueSessionCode();
+  const sessionCode = await createUniqueSessionCode();
 
   const hostPlayer = {
     id: hostPlayerId,
@@ -513,7 +933,12 @@ app.post("/api/sessions", (req, res) => {
     gameState: null,
   };
 
-  sessions.set(sessionCode, session);
+  await saveSession(session);
+  logInfo("session.created", {
+    code: sessionCode,
+    hostPlayerId,
+    hostUsername: username,
+  });
 
   res.status(201).json({
     session: sanitizeSession(session),
@@ -521,14 +946,9 @@ app.post("/api/sessions", (req, res) => {
   });
 });
 
-app.post("/api/sessions/:code/join", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/join", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
-
-  if (session.status !== "lobby") {
-    res.status(409).json({ error: "Session has already started." });
-    return;
-  }
 
   const username = normalizeName(req.body?.username);
   if (!username) {
@@ -536,11 +956,27 @@ app.post("/api/sessions/:code/join", (req, res) => {
     return;
   }
 
-  const duplicateName = session.players.some(
+  const duplicatePlayer = session.players.find(
     (player) => player.username.toLowerCase() === username.toLowerCase(),
   );
-  if (duplicateName) {
-    res.status(409).json({ error: "Username already exists in this session." });
+
+  if (duplicatePlayer) {
+    await touchPlayerLastSeen(session.code, duplicatePlayer.id);
+    logInfo("session.player.reconnected", {
+      code: session.code,
+      playerId: duplicatePlayer.id,
+      username: duplicatePlayer.username,
+    });
+    res.status(200).json({
+      session: sanitizeSession(session),
+      player: duplicatePlayer,
+      reconnected: true,
+    });
+    return;
+  }
+
+  if (session.status !== "lobby") {
+    res.status(409).json({ error: "Session has already started. Use the same username to reconnect." });
     return;
   }
 
@@ -553,27 +989,37 @@ app.post("/api/sessions/:code/join", (req, res) => {
   };
 
   session.players.push(player);
+  await saveSession(session);
+  logInfo("session.player.joined", {
+    code: session.code,
+    playerId: player.id,
+    username: player.username,
+    playersAfterJoin: session.players.length,
+  });
   res.status(201).json({
     session: sanitizeSession(session),
     player,
   });
 });
 
-app.get("/api/sessions/:code", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.get("/api/sessions/:code", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
-  cleanupLegacySessionData(session);
+  const cleaned = cleanupLegacySessionData(session);
+  if (cleaned) {
+    await saveSession(session);
+  }
   res.json({ session: sanitizeSession(session) });
 });
 
-app.get("/api/sessions/:code/players", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.get("/api/sessions/:code/players", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
   res.json({ players: session.players });
 });
 
-app.post("/api/sessions/:code/players/:playerId/team", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/players/:playerId/team", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   const playerId = String(req.params.playerId || "");
@@ -608,6 +1054,8 @@ app.post("/api/sessions/:code/players/:playerId/team", (req, res) => {
     team.playerIds.push(player.id);
   }
 
+  await saveSession(session);
+
   res.json({
     message: "Player assigned to team.",
     player,
@@ -615,8 +1063,8 @@ app.post("/api/sessions/:code/players/:playerId/team", (req, res) => {
   });
 });
 
-app.post("/api/sessions/:code/teams", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/teams", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   const hostPlayerId = normalizeName(req.body?.hostPlayerId);
@@ -685,6 +1133,8 @@ app.post("/api/sessions/:code/teams", (req, res) => {
     }
   }
 
+  await saveSession(session);
+
   res.json({
     message: "Teams saved.",
     skippedPlayers,
@@ -692,8 +1142,8 @@ app.post("/api/sessions/:code/teams", (req, res) => {
   });
 });
 
-app.post("/api/sessions/:code/start", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/start", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   const hostPlayerId = normalizeName(req.body?.hostPlayerId);
@@ -715,14 +1165,22 @@ app.post("/api/sessions/:code/start", (req, res) => {
   session.startedAt = new Date().toISOString();
   session.gameState = buildInitialGameState(session);
 
+  await saveSession(session);
+  logInfo("session.started", {
+    code: session.code,
+    hostPlayerId,
+    teamCount: session.teams.length,
+    playerCount: session.players.length,
+  });
+
   res.json({
     message: "Session started.",
     session: sanitizeSession(session),
   });
 });
 
-app.get("/api/sessions/:code/game-state", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.get("/api/sessions/:code/game-state", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   if (session.status !== "in-game") {
@@ -730,13 +1188,13 @@ app.get("/api/sessions/:code/game-state", (req, res) => {
     return;
   }
 
-  ensureGameState(session);
+  await ensureGameState(session);
   const viewerPlayerId = normalizeName(req.query?.playerId);
   res.json({ gameState: sanitizeGameState(session, viewerPlayerId) });
 });
 
-app.post("/api/sessions/:code/game/roll", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/game/roll", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   if (session.status !== "in-game") {
@@ -744,7 +1202,7 @@ app.post("/api/sessions/:code/game/roll", (req, res) => {
     return;
   }
 
-  ensureGameState(session);
+  await ensureGameState(session);
   const gameState = session.gameState;
   const actorPlayerId = normalizeName(req.body?.actorPlayerId);
   const actorContext = assertActorCanPlayCurrentTurn(session, actorPlayerId, res);
@@ -762,14 +1220,16 @@ app.post("/api/sessions/:code/game/roll", (req, res) => {
   gameState.rollSequence = Number(gameState.rollSequence || 0) + 1;
   resolveMove(session, roll);
 
+  await saveSession(session);
+
   res.json({
     gameState: sanitizeGameState(session, actorPlayerId),
     roll,
   });
 });
 
-app.post("/api/sessions/:code/game/neutral", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/game/neutral", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   if (session.status !== "in-game") {
@@ -777,7 +1237,7 @@ app.post("/api/sessions/:code/game/neutral", (req, res) => {
     return;
   }
 
-  ensureGameState(session);
+  await ensureGameState(session);
   const gameState = session.gameState;
   const actorPlayerId = normalizeName(req.body?.actorPlayerId);
   const actorContext = assertActorCanPlayCurrentTurn(session, actorPlayerId, res);
@@ -802,14 +1262,16 @@ app.post("/api/sessions/:code/game/neutral", (req, res) => {
   gameState.rollSequence = Number(gameState.rollSequence || 0) + 1;
   resolveMove(session, steps);
 
+  await saveSession(session);
+
   res.json({
     gameState: sanitizeGameState(session, actorPlayerId),
     roll: steps,
   });
 });
 
-app.post("/api/sessions/:code/game/answer", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/game/answer", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   if (session.status !== "in-game") {
@@ -817,7 +1279,7 @@ app.post("/api/sessions/:code/game/answer", (req, res) => {
     return;
   }
 
-  ensureGameState(session);
+  await ensureGameState(session);
   const gameState = session.gameState;
   const pendingQuestion = gameState.pendingQuestion;
   const actorPlayerId = normalizeName(req.body?.actorPlayerId);
@@ -862,6 +1324,8 @@ app.post("/api/sessions/:code/game/answer", (req, res) => {
   };
   gameState.updatedAt = new Date().toISOString();
 
+  await saveSession(session);
+
   res.json({
     gameState: sanitizeGameState(session, actorPlayerId),
     correct,
@@ -870,8 +1334,8 @@ app.post("/api/sessions/:code/game/answer", (req, res) => {
   });
 });
 
-app.post("/api/sessions/:code/game/trap-attempt", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/game/trap-attempt", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   if (session.status !== "in-game") {
@@ -879,7 +1343,7 @@ app.post("/api/sessions/:code/game/trap-attempt", (req, res) => {
     return;
   }
 
-  ensureGameState(session);
+  await ensureGameState(session);
   const gameState = session.gameState;
   const actorPlayerId = normalizeName(req.body?.actorPlayerId);
   const actorContext = assertActorCanPlayCurrentTurn(session, actorPlayerId, res);
@@ -907,11 +1371,13 @@ app.post("/api/sessions/:code/game/trap-attempt", (req, res) => {
   gameState.turnMessage = "Championship trap activity: succeed to win, fail and lose one wedge.";
   gameState.updatedAt = new Date().toISOString();
 
+  await saveSession(session);
+
   res.json({ gameState: sanitizeGameState(session, actorPlayerId) });
 });
 
-app.post("/api/sessions/:code/game/trap-result", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/game/trap-result", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   if (session.status !== "in-game") {
@@ -919,7 +1385,7 @@ app.post("/api/sessions/:code/game/trap-result", (req, res) => {
     return;
   }
 
-  ensureGameState(session);
+  await ensureGameState(session);
   const gameState = session.gameState;
   const actorPlayerId = normalizeName(req.body?.actorPlayerId);
   const actorContext = assertActorCanPlayCurrentTurn(session, actorPlayerId, res);
@@ -941,6 +1407,7 @@ app.post("/api/sessions/:code/game/trap-result", (req, res) => {
     gameState.winnerId = activeTeam.id;
     gameState.turnMessage = `${activeTeam.name} succeeded in the championship trap and is crowned Incident Management Champion.`;
     gameState.updatedAt = new Date().toISOString();
+    await saveSession(session);
     res.json({ gameState: sanitizeGameState(session, actorPlayerId) });
     return;
   }
@@ -956,11 +1423,13 @@ app.post("/api/sessions/:code/game/trap-result", (req, res) => {
   gameState.updatedAt = new Date().toISOString();
   advanceGameTurn(session);
 
+  await saveSession(session);
+
   res.json({ gameState: sanitizeGameState(session, actorPlayerId) });
 });
 
-app.post("/api/sessions/:code/score", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/score", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   if (session.status !== "in-game") {
@@ -1017,6 +1486,8 @@ app.post("/api/sessions/:code/score", (req, res) => {
   };
   session.scoreEvents.push(scoreEvent);
 
+  await saveSession(session);
+
   res.json({
     message: "Score updated.",
     scoreEvent,
@@ -1024,8 +1495,8 @@ app.post("/api/sessions/:code/score", (req, res) => {
   });
 });
 
-app.get("/api/sessions/:code/leaderboard", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.get("/api/sessions/:code/leaderboard", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   const leaderboard = [...session.teams]
@@ -1045,8 +1516,8 @@ app.get("/api/sessions/:code/leaderboard", (req, res) => {
   });
 });
 
-app.post("/api/sessions/:code/reset-scores", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.post("/api/sessions/:code/reset-scores", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   const hostPlayerId = normalizeName(req.body?.hostPlayerId);
@@ -1059,14 +1530,16 @@ app.post("/api/sessions/:code/reset-scores", (req, res) => {
   }
   session.scoreEvents = [];
 
+  await saveSession(session);
+
   res.json({
     message: "Scores reset.",
     session: sanitizeSession(session),
   });
 });
 
-app.delete("/api/sessions/:code", (req, res) => {
-  const session = getSessionOr404(req, res);
+app.delete("/api/sessions/:code", async (req, res) => {
+  const session = await getSessionOr404(req, res);
   if (!session) return;
 
   const hostPlayerId = normalizeName(req.body?.hostPlayerId);
@@ -1074,18 +1547,52 @@ app.delete("/api/sessions/:code", (req, res) => {
     return;
   }
 
-  sessions.delete(session.code);
+  await deleteSessionByCode(session.code);
+  logInfo("session.deleted", {
+    code: session.code,
+    requestedBy: hostPlayerId,
+  });
   res.json({ message: "Session deleted." });
 });
 
 app.use((error, req, res, next) => {
   if (error instanceof SyntaxError && "body" in error) {
+    logError("request.invalid_json", error, {
+      requestId: req.requestId || null,
+      method: req.method,
+      path: req.path,
+    });
     res.status(400).json({ error: "Invalid JSON payload." });
     return;
   }
+
+  if (error) {
+    logError("request.unhandled_error", error, {
+      requestId: req.requestId || null,
+      method: req.method,
+      path: req.path,
+    });
+    res.status(500).json({ error: "Internal server error." });
+    return;
+  }
+
   next(error);
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+async function startServer() {
+  await initializeStorage();
+
+  app.listen(PORT, () => {
+    logInfo("server.started", {
+      url: `http://localhost:${PORT}`,
+      storageMode: USE_POSTGRES ? "postgres" : "memory",
+    });
+  });
+}
+
+startServer().catch((error) => {
+  logError("server.start_failed", error, {
+    storageMode: USE_POSTGRES ? "postgres" : "memory",
+  });
+  process.exit(1);
 });
